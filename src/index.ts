@@ -1,9 +1,10 @@
 import {
     Connector,
-    ConnectorTable,
     ConnectorTableCapability,
-    AppTable,
-    inferTable
+    type AppTable,
+    inferTable,
+    type AppTableRow,
+    AppFieldType
 } from 'schemafx';
 import { google, drive_v3, sheets_v4 } from 'googleapis';
 
@@ -63,14 +64,14 @@ export default class GoogleConnector extends Connector {
         return tokens;
     }
 
-    async listTables(path: string[]): Promise<ConnectorTable[]> {
+    async listTables(path: string[]) {
         const auth = this.getAuth();
         const drive = google.drive({ version: 'v3', auth });
         const sheets = google.sheets({ version: 'v4', auth });
 
         // Root
         if (path.length === 0) {
-            const tables: ConnectorTable[] = [
+            const tables = [
                 {
                     name: 'Personal',
                     path: ['folder', 'root'],
@@ -208,5 +209,322 @@ export default class GoogleConnector extends Connector {
         });
 
         return inferTable(sheetName, path, data, this.id);
+    }
+
+    async getData(table: AppTable) {
+        const [type, fileId, sheetName] = table.path;
+
+        if (type !== 'file' || !fileId || !sheetName) {
+            throw new Error('Invalid path for getData. Expected ["file", fileId, sheetName]');
+        }
+
+        const auth = this.getAuth();
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: fileId,
+            range: sheetName
+        });
+
+        const rows = response.data.values || [];
+
+        if (rows.length === 0) {
+            return [];
+        }
+
+        const headers = rows[0].map(h => String(h));
+        const keyFields = table.fields.filter(f => f.isKey).map(f => f.name);
+
+        const data = rows.slice(1).reduce((acc: AppTableRow[], row) => {
+            const rowObj: AppTableRow = {};
+            let hasValidKeys = true;
+
+            headers.forEach((header: string, index: number) => {
+                let value = row[index];
+
+                // Handle JSON parsing
+                const field = table.fields.find(f => f.name === header);
+                if (field && field.type === AppFieldType.JSON && typeof value === 'string') {
+                    try {
+                        value = JSON.parse(value);
+                    } catch (e) {
+                        // Keep as string if parsing fails
+                        console.warn(`Failed to parse JSON for field ${header}:`, e);
+                    }
+                }
+
+                rowObj[header] = value;
+            });
+
+            // Check if key fields are present and not empty
+            if (keyFields.length > 0) {
+                for (const keyField of keyFields) {
+                    const val = rowObj[keyField];
+                    if (val === undefined || val === null || String(val).trim() === '') {
+                        hasValidKeys = false;
+                        break;
+                    }
+                }
+            }
+
+            if (hasValidKeys) {
+                acc.push(rowObj);
+            }
+
+            return acc;
+        }, []);
+
+        return data;
+    }
+
+    async addRow(table: AppTable, row?: AppTableRow) {
+        if (!row) return [];
+        const [type, fileId, sheetName] = table.path;
+
+        if (type !== 'file' || !fileId || !sheetName) {
+            throw new Error('Invalid path for addRow. Expected ["file", fileId, sheetName]');
+        }
+
+        const auth = this.getAuth();
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        // 1. Get current headers
+        const headerResponse = await sheets.spreadsheets.values.get({
+            spreadsheetId: fileId,
+            range: `${sheetName}!A1:ZZ1`
+        });
+
+        let headers =
+            headerResponse.data.values && headerResponse.data.values[0]
+                ? headerResponse.data.values[0].map(h => String(h))
+                : [];
+
+        // 2. Identify new columns
+        const rowKeys = Object.keys(row);
+        const newColumns = rowKeys.filter(key => !headers.includes(key));
+
+        if (newColumns.length > 0) {
+            // Append new columns to header
+            const startColIndex = headers.length;
+            const range = `${sheetName}!${this.getColumnLetter(startColIndex + 1)}1`;
+
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: fileId,
+                range: range,
+                valueInputOption: 'RAW',
+                requestBody: {
+                    values: [newColumns]
+                }
+            });
+
+            headers = [...headers, ...newColumns];
+        }
+
+        // 3. Format row data matching headers
+        const values = headers.map(header => {
+            let value = row[header];
+
+            // Handle JSON stringify
+            const field = table.fields.find(f => f.name === header);
+            if (field && field.type === AppFieldType.JSON && typeof value === 'object') {
+                value = JSON.stringify(value);
+            }
+
+            // Also treat implied objects as JSON if not explicitly defined but value is object
+            if (typeof value === 'object' && value !== null) {
+                value = JSON.stringify(value);
+            }
+
+            return value ?? '';
+        });
+
+        // 4. Append row
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: fileId,
+            range: sheetName,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: {
+                values: [values]
+            }
+        });
+
+        return [row];
+    }
+
+    private getColumnLetter(colIndex: number) {
+        let temp,
+            letter = '';
+
+        while (colIndex > 0) {
+            temp = (colIndex - 1) % 26;
+            letter = String.fromCharCode(temp + 65) + letter;
+            colIndex = (colIndex - temp - 1) / 26;
+        }
+
+        return letter;
+    }
+
+    async updateRow(table: AppTable, key?: Record<string, unknown>, row?: AppTableRow) {
+        if (!key || !row) return [];
+        const [type, fileId, sheetName] = table.path;
+
+        if (type !== 'file' || !fileId || !sheetName) {
+            throw new Error('Invalid path for updateRow. Expected ["file", fileId, sheetName]');
+        }
+
+        const auth = this.getAuth();
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: fileId,
+            range: sheetName
+        });
+
+        const rows = response.data.values || [];
+        if (rows.length === 0) return [];
+
+        const headers = rows[0].map(h => String(h));
+
+        let rowIndex = -1;
+        let existingRowData: Record<string, unknown> = {};
+
+        for (let i = 1; i < rows.length; i++) {
+            const currentRow = rows[i];
+            const currentRowObj: Record<string, unknown> = {};
+            headers.forEach((h, idx) => {
+                currentRowObj[h] = currentRow[idx];
+            });
+
+            let match = true;
+            for (const k in key) {
+                if (String(currentRowObj[k]) !== String(key[k])) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                rowIndex = i;
+                existingRowData = currentRowObj;
+                break;
+            }
+        }
+
+        if (rowIndex === -1) {
+            return [];
+        }
+
+        const rowKeys = Object.keys(row);
+        const newColumns = rowKeys.filter(k => !headers.includes(k));
+        let updatedHeaders = [...headers];
+
+        if (newColumns.length > 0) {
+            const startColIndex = headers.length;
+            const range = `${sheetName}!${this.getColumnLetter(startColIndex + 1)}1`;
+
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: fileId,
+                range: range,
+                valueInputOption: 'RAW',
+                requestBody: {
+                    values: [newColumns]
+                }
+            });
+
+            updatedHeaders = [...headers, ...newColumns];
+        }
+
+        const mergedData = { ...existingRowData, ...row };
+        const values = updatedHeaders.map(header => {
+            let value = mergedData[header];
+
+            const field = table.fields.find(f => f.name === header);
+            if (field && field.type === AppFieldType.JSON && typeof value === 'object') {
+                value = JSON.stringify(value);
+            }
+            if (typeof value === 'object' && value !== null) {
+                value = JSON.stringify(value);
+            }
+
+            return value ?? '';
+        });
+
+        const sheetRowNumber = rowIndex + 1;
+        const range = `${sheetName}!A${sheetRowNumber}`;
+
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: fileId,
+            range: range,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: {
+                values: [values]
+            }
+        });
+
+        return [mergedData];
+    }
+
+    async deleteRow(table: AppTable, key?: Record<string, unknown>) {
+        if (!key) return [];
+        const [type, fileId, sheetName] = table.path;
+
+        if (type !== 'file' || !fileId || !sheetName) {
+            throw new Error('Invalid path for deleteRow. Expected ["file", fileId, sheetName]');
+        }
+
+        const auth = this.getAuth();
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        // 1. Fetch data to find the row
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: fileId,
+            range: sheetName
+        });
+
+        const rows = response.data.values || [];
+        if (rows.length === 0) return [];
+
+        const headers = rows[0].map(h => String(h));
+
+        // Find row index
+        let rowIndex = -1;
+        let foundRowData: Record<string, unknown> = {};
+
+        for (let i = 1; i < rows.length; i++) {
+            const currentRow = rows[i];
+            const currentRowObj: Record<string, unknown> = {};
+            headers.forEach((h, idx) => {
+                currentRowObj[h] = currentRow[idx];
+            });
+
+            // Check if matches key
+            let match = true;
+            for (const k in key) {
+                if (String(currentRowObj[k]) !== String(key[k])) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                rowIndex = i;
+                foundRowData = currentRowObj;
+                break;
+            }
+        }
+
+        if (rowIndex === -1) {
+            return [];
+        }
+
+        const sheetRowNumber = rowIndex + 1;
+        const range = `${sheetName}!A${sheetRowNumber}:ZZ${sheetRowNumber}`;
+
+        await sheets.spreadsheets.values.clear({
+            spreadsheetId: fileId,
+            range: range
+        });
+
+        return [foundRowData];
     }
 }
