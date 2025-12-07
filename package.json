@@ -1,10 +1,10 @@
 {
-    "name": "schemafx",
+    "name": "@schemafx/connector-google",
     "version": "0.0.0",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "author": "SchemaFX",
-    "description": "Build Without Boundaries.",
+    "description": "Build With Google.",
     "scripts": {
         "build": "tsc",
         "start": "node .",
