@@ -1,6 +1,5 @@
 import {
     Connector,
-    type ConnectorTable,
     ConnectorTableCapability,
     type AppTable,
     inferTable,
