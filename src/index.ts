@@ -1,5 +1,6 @@
 import {
     Connector,
+    type ConnectorTable,
     ConnectorTableCapability,
     type AppTable,
     inferTable,
@@ -69,7 +70,6 @@ export default class GoogleConnector extends Connector {
         const drive = google.drive({ version: 'v3', auth });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // Root
         if (path.length === 0) {
             const tables = [
                 {
@@ -93,7 +93,6 @@ export default class GoogleConnector extends Connector {
                     });
                 }
             } catch (error) {
-                // Ignore error if shared drives cannot be listed, just don't show the folder
                 console.warn('Could not list shared drives:', error);
             }
 
@@ -102,7 +101,6 @@ export default class GoogleConnector extends Connector {
 
         const [type, id] = path;
 
-        // List Shared Drives
         if (type === 'drives') {
             const response = await drive.drives.list({
                 pageSize: 100
@@ -115,10 +113,7 @@ export default class GoogleConnector extends Connector {
             }));
         }
 
-        // List Folder (Personal or Shared Drive)
         if (type === 'folder' || type === 'drive') {
-            // If it's a shared drive, the id is the drive id.
-            // When listing a shared drive, we need specific query parameters.
             const isSharedDrive = type === 'drive';
             const queryParams: drive_v3.Params$Resource$Files$List = {
                 q: `'${id}' in parents and trashed = false`,
@@ -138,8 +133,6 @@ export default class GoogleConnector extends Connector {
             return (response.data.files || []).map((file: drive_v3.Schema$File) => {
                 let capability = ConnectorTableCapability.Unavailable;
                 let nextPath: string[] = [];
-                // By default explore files with same path in case we want to support other file types later
-                // But for now only specific ones have capabilities
                 const currentPath = ['file', file.id!];
 
                 if (file.mimeType === 'application/vnd.google-apps.folder') {
@@ -158,10 +151,7 @@ export default class GoogleConnector extends Connector {
             });
         }
 
-        // List Sheets in a Spreadsheet
         if (type === 'file') {
-            // path is ['file', fileId]
-            // We want to return list of sheets.
             const response = await sheets.spreadsheets.get({
                 spreadsheetId: id
             });
@@ -176,7 +166,7 @@ export default class GoogleConnector extends Connector {
         return [];
     }
 
-    async getTable(path: string[]): Promise<AppTable> {
+    async getTable(path: string[]) {
         const [type, fileId, sheetName] = path;
 
         if (type !== 'file' || !fileId || !sheetName) {
@@ -193,8 +183,6 @@ export default class GoogleConnector extends Connector {
 
         const rows = response.data.values || [];
 
-        // Convert to AppTableRow objects
-        // Assuming first row is header
         if (rows.length === 0) {
             return inferTable(sheetName, path, [], this.id);
         }
@@ -242,13 +230,11 @@ export default class GoogleConnector extends Connector {
             headers.forEach((header: string, index: number) => {
                 let value = row[index];
 
-                // Handle JSON parsing
                 const field = table.fields.find(f => f.name === header);
                 if (field && field.type === AppFieldType.JSON && typeof value === 'string') {
                     try {
                         value = JSON.parse(value);
                     } catch (e) {
-                        // Keep as string if parsing fails
                         console.warn(`Failed to parse JSON for field ${header}:`, e);
                     }
                 }
@@ -256,7 +242,6 @@ export default class GoogleConnector extends Connector {
                 rowObj[header] = value;
             });
 
-            // Check if key fields are present and not empty
             if (keyFields.length > 0) {
                 for (const keyField of keyFields) {
                     const val = rowObj[keyField];
@@ -288,7 +273,6 @@ export default class GoogleConnector extends Connector {
         const auth = this.getAuth();
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Get current headers
         const headerResponse = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
             range: `${sheetName}!A1:ZZ1`
@@ -299,12 +283,10 @@ export default class GoogleConnector extends Connector {
                 ? headerResponse.data.values[0].map(h => String(h))
                 : [];
 
-        // 2. Identify new columns
         const rowKeys = Object.keys(row);
         const newColumns = rowKeys.filter(key => !headers.includes(key));
 
         if (newColumns.length > 0) {
-            // Append new columns to header
             const startColIndex = headers.length;
             const range = `${sheetName}!${this.getColumnLetter(startColIndex + 1)}1`;
 
@@ -320,17 +302,14 @@ export default class GoogleConnector extends Connector {
             headers = [...headers, ...newColumns];
         }
 
-        // 3. Format row data matching headers
         const values = headers.map(header => {
             let value = row[header];
 
-            // Handle JSON stringify
             const field = table.fields.find(f => f.name === header);
             if (field && field.type === AppFieldType.JSON && typeof value === 'object') {
                 value = JSON.stringify(value);
             }
 
-            // Also treat implied objects as JSON if not explicitly defined but value is object
             if (typeof value === 'object' && value !== null) {
                 value = JSON.stringify(value);
             }
@@ -338,7 +317,6 @@ export default class GoogleConnector extends Connector {
             return value ?? '';
         });
 
-        // 4. Append row
         await sheets.spreadsheets.values.append({
             spreadsheetId: fileId,
             range: sheetName,
@@ -348,19 +326,17 @@ export default class GoogleConnector extends Connector {
             }
         });
 
-        return [row];
+        return this.getData(table);
     }
 
     private getColumnLetter(colIndex: number) {
         let temp,
             letter = '';
-
         while (colIndex > 0) {
             temp = (colIndex - 1) % 26;
             letter = String.fromCharCode(temp + 65) + letter;
             colIndex = (colIndex - temp - 1) / 26;
         }
-
         return letter;
     }
 
@@ -461,7 +437,7 @@ export default class GoogleConnector extends Connector {
             }
         });
 
-        return [mergedData];
+        return this.getData(table);
     }
 
     async deleteRow(table: AppTable, key?: Record<string, unknown>) {
@@ -475,7 +451,6 @@ export default class GoogleConnector extends Connector {
         const auth = this.getAuth();
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Fetch data to find the row
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
             range: sheetName
@@ -486,10 +461,7 @@ export default class GoogleConnector extends Connector {
 
         const headers = rows[0].map(h => String(h));
 
-        // Find row index
         let rowIndex = -1;
-        let foundRowData: Record<string, unknown> = {};
-
         for (let i = 1; i < rows.length; i++) {
             const currentRow = rows[i];
             const currentRowObj: Record<string, unknown> = {};
@@ -497,7 +469,6 @@ export default class GoogleConnector extends Connector {
                 currentRowObj[h] = currentRow[idx];
             });
 
-            // Check if matches key
             let match = true;
             for (const k in key) {
                 if (String(currentRowObj[k]) !== String(key[k])) {
@@ -508,13 +479,12 @@ export default class GoogleConnector extends Connector {
 
             if (match) {
                 rowIndex = i;
-                foundRowData = currentRowObj;
                 break;
             }
         }
 
         if (rowIndex === -1) {
-            return [];
+            return this.getData(table);
         }
 
         const sheetRowNumber = rowIndex + 1;
@@ -525,6 +495,6 @@ export default class GoogleConnector extends Connector {
             range: range
         });
 
-        return [foundRowData];
+        return this.getData(table);
     }
 }
