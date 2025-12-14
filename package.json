@@ -7,8 +7,6 @@
     "description": "Build With Google.",
     "scripts": {
         "build": "tsc",
-        "start": "node .",
-        "dev": "tsx watch src/index.ts",
         "prepare": "npm run build",
         "lint": "eslint",
         "test": "npm run test:types",
