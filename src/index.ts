@@ -8,66 +8,74 @@ import {
 } from 'schemafx';
 import { google, drive_v3, sheets_v4 } from 'googleapis';
 
+export type GoogleConnectorOptions = {
+    name: string;
+    id?: string;
+    clientId: string;
+    clientSecret: string;
+    redirectUri: string;
+};
+
 export default class GoogleConnector extends Connector {
-    private getOAuthClient() {
-        const clientId = process.env.GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-        const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+    clientId: string;
+    clientSecret: string;
+    redirectUri: string;
 
-        if (!clientId || !clientSecret || !redirectUri) {
-            throw new Error(
-                'Missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or GOOGLE_REDIRECT_URI environment variables'
-            );
-        }
+    constructor(options: GoogleConnectorOptions) {
+        super(options.name, options.id);
 
-        return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+        this.clientId = options.clientId;
+        this.clientSecret = options.clientSecret;
+        this.redirectUri = options.redirectUri;
     }
 
-    private getAuth() {
+    private getOAuthClient() {
+        return new google.auth.OAuth2(this.clientId, this.clientSecret, this.redirectUri);
+    }
+
+    private getAuth(auth?: string) {
+        if (!auth) throw new Error('Unauthorized');
+
         const oauth2Client = this.getOAuthClient();
-        const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-
-        if (!refreshToken) {
-            const authUrl = oauth2Client.generateAuthUrl({
-                access_type: 'offline',
-                scope: [
-                    'https://www.googleapis.com/auth/drive',
-                    'https://www.googleapis.com/auth/spreadsheets'
-                ]
-            });
-            throw new Error(
-                `Missing GOOGLE_REFRESH_TOKEN. Authorize the app by visiting this url: ${authUrl}`
-            );
-        }
-
         oauth2Client.setCredentials({
-            refresh_token: refreshToken
+            refresh_token: auth
         });
 
         return oauth2Client;
     }
 
-    async authorize(code: string) {
-        const oauth2Client = this.getOAuthClient();
-        const { tokens } = await oauth2Client.getToken(code);
-
-        console.log('Successfully retrieved tokens.');
-        console.log('Add the following to your environment variables:');
-        console.log(`GOOGLE_REFRESH_TOKEN=${tokens.refresh_token}`);
-
-        if (!tokens.refresh_token) {
-            console.warn(
-                'No refresh_token returned. Make sure you used access_type: "offline" and that the user approved access.'
-            );
-        }
-
-        return tokens;
+    async getAuthUrl(): Promise<string> {
+        return this.getOAuthClient().generateAuthUrl({
+            access_type: 'offline',
+            prompt: 'consent',
+            scope: [
+                'https://www.googleapis.com/auth/userinfo.email',
+                'https://www.googleapis.com/auth/drive',
+                'https://www.googleapis.com/auth/spreadsheets'
+            ]
+        });
     }
 
-    async listTables(path: string[]) {
-        const auth = this.getAuth();
-        const drive = google.drive({ version: 'v3', auth });
-        const sheets = google.sheets({ version: 'v4', auth });
+    async authorize(body: Record<string, unknown>) {
+        const oauth2Client = this.getOAuthClient();
+        const { tokens } = await oauth2Client.getToken(body.code as string);
+
+        if (!tokens.refresh_token) {
+            throw new Error('No refresh_token returned.');
+        }
+
+        return {
+            name: tokens.access_token
+                ? ((await oauth2Client.getTokenInfo(tokens.access_token)).email ?? '')
+                : '',
+            content: tokens.refresh_token
+        };
+    }
+
+    async listTables(path: string[], auth?: string) {
+        const _auth = this.getAuth(auth);
+        const drive = google.drive({ version: 'v3', auth: _auth });
+        const sheets = google.sheets({ version: 'v4', auth: _auth });
 
         if (path.length === 0) {
             const tables = [
@@ -165,15 +173,15 @@ export default class GoogleConnector extends Connector {
         return [];
     }
 
-    async getTable(path: string[]) {
+    async getTable(path: string[], auth?: string) {
         const [type, fileId, sheetName] = path;
 
         if (type !== 'file' || !fileId || !sheetName) {
             throw new Error('Invalid path for getTable. Expected ["file", fileId, sheetName]');
         }
 
-        const auth = this.getAuth();
-        const sheets = google.sheets({ version: 'v4', auth });
+        const _auth = this.getAuth(auth);
+        const sheets = google.sheets({ version: 'v4', auth: _auth });
 
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
@@ -198,15 +206,15 @@ export default class GoogleConnector extends Connector {
         return inferTable(sheetName, path, data, this.id);
     }
 
-    async getData(table: AppTable) {
+    async getData(table: AppTable, auth?: string) {
         const [type, fileId, sheetName] = table.path;
 
         if (type !== 'file' || !fileId || !sheetName) {
             throw new Error('Invalid path for getData. Expected ["file", fileId, sheetName]');
         }
 
-        const auth = this.getAuth();
-        const sheets = google.sheets({ version: 'v4', auth });
+        const _auth = this.getAuth(auth);
+        const sheets = google.sheets({ version: 'v4', auth: _auth });
 
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
@@ -261,16 +269,17 @@ export default class GoogleConnector extends Connector {
         return data;
     }
 
-    async addRow(table: AppTable, row?: AppTableRow) {
-        if (!row) return [];
+    async addRow(table: AppTable, auth?: string, row?: AppTableRow) {
+        if (!row) return;
+
         const [type, fileId, sheetName] = table.path;
 
         if (type !== 'file' || !fileId || !sheetName) {
             throw new Error('Invalid path for addRow. Expected ["file", fileId, sheetName]');
         }
 
-        const auth = this.getAuth();
-        const sheets = google.sheets({ version: 'v4', auth });
+        const _auth = this.getAuth(auth);
+        const sheets = google.sheets({ version: 'v4', auth: _auth });
 
         const headerResponse = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
@@ -324,31 +333,36 @@ export default class GoogleConnector extends Connector {
                 values: [values]
             }
         });
-
-        return this.getData(table);
     }
 
     private getColumnLetter(colIndex: number) {
         let temp,
             letter = '';
+
         while (colIndex > 0) {
             temp = (colIndex - 1) % 26;
             letter = String.fromCharCode(temp + 65) + letter;
             colIndex = (colIndex - temp - 1) / 26;
         }
+
         return letter;
     }
 
-    async updateRow(table: AppTable, key?: Record<string, unknown>, row?: AppTableRow) {
-        if (!key || !row) return [];
+    async updateRow(
+        table: AppTable,
+        auth?: string,
+        key?: Record<string, unknown>,
+        row?: AppTableRow
+    ) {
+        if (!key || !row) return;
         const [type, fileId, sheetName] = table.path;
 
         if (type !== 'file' || !fileId || !sheetName) {
             throw new Error('Invalid path for updateRow. Expected ["file", fileId, sheetName]');
         }
 
-        const auth = this.getAuth();
-        const sheets = google.sheets({ version: 'v4', auth });
+        const _auth = this.getAuth(auth);
+        const sheets = google.sheets({ version: 'v4', auth: _auth });
 
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
@@ -356,7 +370,7 @@ export default class GoogleConnector extends Connector {
         });
 
         const rows = response.data.values || [];
-        if (rows.length === 0) return [];
+        if (rows.length === 0) return;
 
         const headers = rows[0].map(h => String(h));
 
@@ -386,7 +400,7 @@ export default class GoogleConnector extends Connector {
         }
 
         if (rowIndex === -1) {
-            return [];
+            return;
         }
 
         const rowKeys = Object.keys(row);
@@ -435,20 +449,18 @@ export default class GoogleConnector extends Connector {
                 values: [values]
             }
         });
-
-        return this.getData(table);
     }
 
-    async deleteRow(table: AppTable, key?: Record<string, unknown>) {
-        if (!key) return [];
+    async deleteRow(table: AppTable, auth?: string, key?: Record<string, unknown>) {
+        if (!key) return;
         const [type, fileId, sheetName] = table.path;
 
         if (type !== 'file' || !fileId || !sheetName) {
             throw new Error('Invalid path for deleteRow. Expected ["file", fileId, sheetName]');
         }
 
-        const auth = this.getAuth();
-        const sheets = google.sheets({ version: 'v4', auth });
+        const _auth = this.getAuth(auth);
+        const sheets = google.sheets({ version: 'v4', auth: _auth });
 
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId: fileId,
@@ -456,7 +468,7 @@ export default class GoogleConnector extends Connector {
         });
 
         const rows = response.data.values || [];
-        if (rows.length === 0) return [];
+        if (rows.length === 0) return;
 
         const headers = rows[0].map(h => String(h));
 
@@ -482,9 +494,7 @@ export default class GoogleConnector extends Connector {
             }
         }
 
-        if (rowIndex === -1) {
-            return this.getData(table);
-        }
+        if (rowIndex === -1) return;
 
         const sheetRowNumber = rowIndex + 1;
         const range = `${sheetName}!A${sheetRowNumber}:ZZ${sheetRowNumber}`;
@@ -493,7 +503,5 @@ export default class GoogleConnector extends Connector {
             spreadsheetId: fileId,
             range: range
         });
-
-        return this.getData(table);
     }
 }
