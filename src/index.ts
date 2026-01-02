@@ -4,7 +4,9 @@ import {
     type AppTable,
     inferTable,
     type AppTableRow,
-    AppFieldType
+    AppFieldType,
+    DataSourceType,
+    type DataSourceDefinition
 } from 'schemafx';
 import { google, drive_v3, sheets_v4 } from 'googleapis';
 
@@ -30,7 +32,11 @@ export default class GoogleConnector extends Connector {
     }
 
     private getOAuthClient() {
-        return new google.auth.OAuth2(this.clientId, this.clientSecret, this.redirectUri);
+        return new google.auth.OAuth2(
+            this.clientId,
+            this.clientSecret,
+            new URL(`api/connectors/${this.id}/auth/callback`, this.redirectUri).href
+        );
     }
 
     private getAuth(auth?: string) {
@@ -44,7 +50,7 @@ export default class GoogleConnector extends Connector {
         return oauth2Client;
     }
 
-    async getAuthUrl(): Promise<string> {
+    override async getAuthUrl(): Promise<string> {
         return this.getOAuthClient().generateAuthUrl({
             access_type: 'offline',
             prompt: 'consent',
@@ -56,7 +62,7 @@ export default class GoogleConnector extends Connector {
         });
     }
 
-    async authorize(body: Record<string, unknown>) {
+    override async authorize(body: Record<string, unknown>) {
         const oauth2Client = this.getOAuthClient();
         const { tokens } = await oauth2Client.getToken(body.code as string);
 
@@ -64,15 +70,18 @@ export default class GoogleConnector extends Connector {
             throw new Error('No refresh_token returned.');
         }
 
+        const email = tokens.access_token
+            ? ((await oauth2Client.getTokenInfo(tokens.access_token)).email ?? '')
+            : '';
+
         return {
-            name: tokens.access_token
-                ? ((await oauth2Client.getTokenInfo(tokens.access_token)).email ?? '')
-                : '',
-            content: tokens.refresh_token
+            name: email,
+            content: tokens.refresh_token,
+            email
         };
     }
 
-    async listTables(path: string[], auth?: string) {
+    override async listTables(path: string[], auth?: string) {
         const _auth = this.getAuth(auth);
         const drive = google.drive({ version: 'v3', auth: _auth });
         const sheets = google.sheets({ version: 'v4', auth: _auth });
@@ -165,7 +174,7 @@ export default class GoogleConnector extends Connector {
 
             return (response.data.sheets || []).map((sheet: sheets_v4.Schema$Sheet) => ({
                 name: sheet.properties?.title || 'Unknown Sheet',
-                path: ['file', id, sheet.properties?.title || ''],
+                path: ['file', id!, sheet.properties?.title || ''],
                 capabilities: [ConnectorTableCapability.Connect]
             }));
         }
@@ -173,7 +182,7 @@ export default class GoogleConnector extends Connector {
         return [];
     }
 
-    async getTable(path: string[], auth?: string) {
+    override async getTable(path: string[], auth?: string) {
         const [type, fileId, sheetName] = path;
 
         if (type !== 'file' || !fileId || !sheetName) {
@@ -194,23 +203,24 @@ export default class GoogleConnector extends Connector {
             return inferTable(sheetName, path, [], this.id);
         }
 
-        const headers = rows[0].map(h => String(h));
+        const headers = rows[0]!.map(h => String(h));
         const data = rows.slice(1).map((row: Record<string, unknown>[]) => {
             const rowObj: Record<string, unknown> = {};
             headers.forEach((header: string, index: number) => {
                 rowObj[header] = row[index];
             });
+
             return rowObj;
         });
 
         return inferTable(sheetName, path, data, this.id);
     }
 
-    async getData(table: AppTable, auth?: string) {
+    override async getData(table: AppTable, auth?: string): Promise<DataSourceDefinition> {
         const [type, fileId, sheetName] = table.path;
 
         if (type !== 'file' || !fileId || !sheetName) {
-            throw new Error('Invalid path for getData. Expected ["file", fileId, sheetName]');
+            return { type: DataSourceType.Inline, data: [] };
         }
 
         const _auth = this.getAuth(auth);
@@ -224,10 +234,10 @@ export default class GoogleConnector extends Connector {
         const rows = response.data.values || [];
 
         if (rows.length === 0) {
-            return [];
+            return { type: DataSourceType.Inline, data: [] };
         }
 
-        const headers = rows[0].map(h => String(h));
+        const headers = rows[0]!.map(h => String(h));
         const keyFields = table.fields.filter(f => f.isKey).map(f => f.name);
 
         const data = rows.slice(1).reduce((acc: AppTableRow[], row) => {
@@ -266,10 +276,10 @@ export default class GoogleConnector extends Connector {
             return acc;
         }, []);
 
-        return data;
+        return { type: DataSourceType.Inline, data };
     }
 
-    async addRow(table: AppTable, auth?: string, row?: AppTableRow) {
+    override async addRow(table: AppTable, auth?: string, row?: AppTableRow) {
         if (!row) return;
 
         const [type, fileId, sheetName] = table.path;
@@ -348,7 +358,7 @@ export default class GoogleConnector extends Connector {
         return letter;
     }
 
-    async updateRow(
+    override async updateRow(
         table: AppTable,
         auth?: string,
         key?: Record<string, unknown>,
@@ -372,13 +382,13 @@ export default class GoogleConnector extends Connector {
         const rows = response.data.values || [];
         if (rows.length === 0) return;
 
-        const headers = rows[0].map(h => String(h));
+        const headers = rows[0]!.map(h => String(h));
 
         let rowIndex = -1;
         let existingRowData: Record<string, unknown> = {};
 
         for (let i = 1; i < rows.length; i++) {
-            const currentRow = rows[i];
+            const currentRow = rows[i]!;
             const currentRowObj: Record<string, unknown> = {};
             headers.forEach((h, idx) => {
                 currentRowObj[h] = currentRow[idx];
@@ -451,7 +461,7 @@ export default class GoogleConnector extends Connector {
         });
     }
 
-    async deleteRow(table: AppTable, auth?: string, key?: Record<string, unknown>) {
+    override async deleteRow(table: AppTable, auth?: string, key?: Record<string, unknown>) {
         if (!key) return;
         const [type, fileId, sheetName] = table.path;
 
@@ -470,11 +480,11 @@ export default class GoogleConnector extends Connector {
         const rows = response.data.values || [];
         if (rows.length === 0) return;
 
-        const headers = rows[0].map(h => String(h));
+        const headers = rows[0]!.map(h => String(h));
 
         let rowIndex = -1;
         for (let i = 1; i < rows.length; i++) {
-            const currentRow = rows[i];
+            const currentRow = rows[i]!;
             const currentRowObj: Record<string, unknown> = {};
             headers.forEach((h, idx) => {
                 currentRowObj[h] = currentRow[idx];
