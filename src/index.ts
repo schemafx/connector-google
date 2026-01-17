@@ -1,18 +1,18 @@
 import {
+    AppFieldType,
+    type AppTable,
+    type AppTableRow,
     Connector,
     ConnectorTableCapability,
-    type AppTable,
-    inferTable,
-    type AppTableRow,
-    AppFieldType,
+    type ConnectorOptions,
     DataSourceType,
-    type DataSourceDefinition
+    type DataSourceDefinition,
+    inferTable
 } from 'schemafx';
+
 import { google, drive_v3, sheets_v4 } from 'googleapis';
 
-export type GoogleConnectorOptions = {
-    name: string;
-    id?: string;
+export type GoogleConnectorOptions = ConnectorOptions & {
     clientId: string;
     clientSecret: string;
     redirectUri: string;
@@ -24,7 +24,7 @@ export default class GoogleConnector extends Connector {
     redirectUri: string;
 
     constructor(options: GoogleConnectorOptions) {
-        super(options.name, options.id);
+        super(options);
 
         this.clientId = options.clientId;
         this.clientSecret = options.clientSecret;
@@ -32,11 +32,11 @@ export default class GoogleConnector extends Connector {
     }
 
     private getOAuthClient() {
-        return new google.auth.OAuth2(
-            this.clientId,
-            this.clientSecret,
-            new URL(`api/connectors/${this.id}/auth/callback`, this.redirectUri).href
-        );
+        return new google.auth.OAuth2({
+            clientId: this.clientId,
+            clientSecret: this.clientSecret,
+            redirectUri: new URL(`api/connectors/${this.id}/auth/callback`, this.redirectUri).href
+        });
     }
 
     private getAuth(auth?: string) {
