@@ -1,12 +1,13 @@
 {
     "name": "@schemafx/connector-google",
-    "version": "0.0.0",
+    "version": "0.0.1",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "author": "SchemaFX",
     "description": "Build With Google.",
     "scripts": {
-        "build": "tsc",
+        "build": "npm run build:clean && tsc -b --clean tsconfig.build.json && tsc -b tsconfig.build.json",
+        "build:clean": "node -e \"const fs = require('node:fs'); if (fs.existsSync('dist')) fs.rmSync('dist', { recursive: true, force: true })\"",
         "prepare": "npm run build",
         "lint": "eslint",
         "test": "npm run test:types",
@@ -24,8 +25,10 @@
         "@typescript-eslint/eslint-plugin": "^8.44.0",
         "@typescript-eslint/parser": "^8.44.0",
         "eslint": "^9.35.0",
+        "eslint-config-flat-gitignore": "^2.1.0",
         "eslint-config-prettier": "^10.1.8",
         "eslint-plugin-prettier": "^5.5.4",
+        "eslint-plugin-sonarjs": "^3.0.5",
         "prettier": "^3.6.2",
         "tsx": "^4.20.3",
         "typescript": "^5.8.3"
