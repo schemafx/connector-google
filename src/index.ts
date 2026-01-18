@@ -10,7 +10,7 @@ import {
     inferTable
 } from 'schemafx';
 
-import { google, drive_v3, sheets_v4 } from 'googleapis';
+import { google, type drive_v3, type sheets_v4 } from 'googleapis';
 
 export type GoogleConnectorOptions = ConnectorOptions & {
     clientId: string;
