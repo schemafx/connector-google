@@ -200,7 +200,7 @@ export default class GoogleConnector extends Connector {
         const rows = response.data.values || [];
 
         if (rows.length === 0) {
-            return inferTable(sheetName, path, [], this.id);
+            return inferTable(sheetName, []);
         }
 
         const headers = rows[0]!.map(h => String(h));
@@ -213,7 +213,7 @@ export default class GoogleConnector extends Connector {
             return rowObj;
         });
 
-        return inferTable(sheetName, path, data, this.id);
+        return inferTable(sheetName, data);
     }
 
     override async getData(table: AppTable, auth?: string): Promise<DataSourceDefinition> {
