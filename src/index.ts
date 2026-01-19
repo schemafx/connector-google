@@ -133,7 +133,7 @@ export default class GoogleConnector extends Connector {
             const isSharedDrive = type === 'drive';
             const queryParams: drive_v3.Params$Resource$Files$List = {
                 q: `'${id}' in parents and trashed = false`,
-                fields: 'nextPageToken, files(id, name, mimeType)',
+                fields: 'nextPageToken, files(id, name, mimeType, shortcutDetails)',
                 pageSize: 100,
                 includeItemsFromAllDrives: true,
                 supportsAllDrives: true
@@ -151,12 +151,19 @@ export default class GoogleConnector extends Connector {
                 let nextPath: string[] = [];
                 const currentPath = ['file', file.id!];
 
-                if (file.mimeType === 'application/vnd.google-apps.folder') {
+                const isShortcut = file.mimeType === 'application/vnd.google-apps.shortcut';
+                const targetMimeType = isShortcut
+                    ? file.shortcutDetails?.targetMimeType
+                    : file.mimeType;
+
+                const targetId = isShortcut ? file.shortcutDetails?.targetId : file.id;
+
+                if (targetMimeType === 'application/vnd.google-apps.folder') {
                     capability = ConnectorTableCapability.Explore;
-                    nextPath = ['folder', file.id!];
-                } else if (file.mimeType === 'application/vnd.google-apps.spreadsheet') {
+                    nextPath = ['folder', targetId!];
+                } else if (targetMimeType === 'application/vnd.google-apps.spreadsheet') {
                     capability = ConnectorTableCapability.Explore;
-                    nextPath = ['file', file.id!];
+                    nextPath = ['file', targetId!];
                 }
 
                 return {
