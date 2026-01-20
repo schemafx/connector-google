@@ -66,9 +66,7 @@ export default class GoogleConnector extends Connector {
         const oauth2Client = this.getOAuthClient();
         const { tokens } = await oauth2Client.getToken(body.code as string);
 
-        if (!tokens.refresh_token) {
-            throw new Error('No refresh_token returned.');
-        }
+        if (!tokens.refresh_token) throw new Error('No refresh_token returned.');
 
         const email = tokens.access_token
             ? ((await oauth2Client.getTokenInfo(tokens.access_token)).email ?? '')
@@ -206,9 +204,7 @@ export default class GoogleConnector extends Connector {
 
         const rows = response.data.values || [];
 
-        if (rows.length === 0) {
-            return inferTable(sheetName, []);
-        }
+        if (rows.length === 0) return inferTable(sheetName, []);
 
         const headers = rows[0]!.map(h => String(h));
         const data = rows.slice(1).map((row: Record<string, unknown>[]) => {
@@ -276,10 +272,7 @@ export default class GoogleConnector extends Connector {
                 }
             }
 
-            if (hasValidKeys) {
-                acc.push(rowObj);
-            }
-
+            if (hasValidKeys) acc.push(rowObj);
             return acc;
         }, []);
 
@@ -335,10 +328,7 @@ export default class GoogleConnector extends Connector {
                 value = JSON.stringify(value);
             }
 
-            if (typeof value === 'object' && value !== null) {
-                value = JSON.stringify(value);
-            }
-
+            if (typeof value === 'object' && value !== null) value = JSON.stringify(value);
             return value ?? '';
         });
 
@@ -416,9 +406,7 @@ export default class GoogleConnector extends Connector {
             }
         }
 
-        if (rowIndex === -1) {
-            return;
-        }
+        if (rowIndex === -1) return;
 
         const rowKeys = Object.keys(row);
         const newColumns = rowKeys.filter(k => !headers.includes(k));
@@ -448,6 +436,7 @@ export default class GoogleConnector extends Connector {
             if (field && field.type === AppFieldType.JSON && typeof value === 'object') {
                 value = JSON.stringify(value);
             }
+
             if (typeof value === 'object' && value !== null) {
                 value = JSON.stringify(value);
             }
