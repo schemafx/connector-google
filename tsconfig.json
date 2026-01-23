@@ -2,10 +2,8 @@
     "compilerOptions": {
         "composite": true,
         "target": "ES2020",
-        "module": "ESNext",
-        "outDir": "./dist",
-        "rootDir": "./src",
-        "moduleResolution": "Node",
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
         "esModuleInterop": true,
         "forceConsistentCasingInFileNames": true,
         "strict": true,
@@ -13,9 +11,16 @@
         "resolveJsonModule": true,
         "declaration": true,
         "declarationMap": true,
-        "typeRoots": ["node_modules/@types"],
-        "types": ["node"]
+        "typeRoots": ["node_modules/@types", "src/types"],
+        "types": ["node"],
+        "verbatimModuleSyntax": true,
+        "noUncheckedIndexedAccess": true,
+        "noImplicitOverride": true,
+        "incremental": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "noImplicitReturns": true
     },
-    "include": ["src"],
-    "exclude": ["node_modules", "dist", "test", "**/*.spec.ts", "**/*.test.ts"]
+    "include": ["src", "src/**/*.json", "tests"],
+    "exclude": ["node_modules"]
 }
