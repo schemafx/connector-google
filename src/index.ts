@@ -1,16 +1,21 @@
 import {
-    AppFieldType,
     type AppTable,
     type AppTableRow,
     Connector,
     ConnectorTableCapability,
     type ConnectorOptions,
-    DataSourceType,
-    type DataSourceDefinition,
-    inferTable
+    type DataSourceDefinition
 } from 'schemafx';
 
 import { google, type drive_v3, type sheets_v4 } from 'googleapis';
+import {
+    spreadsheetHandler,
+    csvHandler,
+    jsonHandler,
+    type GoogleClients
+} from './handlers/index.js';
+
+import { validateFileId } from './handlers/utils.js';
 
 export type GoogleConnectorOptions = ConnectorOptions & {
     clientId: string;
@@ -50,6 +55,28 @@ export default class GoogleConnector extends Connector {
         return oauth2Client;
     }
 
+    private getClients(auth?: string): GoogleClients {
+        const _auth = this.getAuth(auth);
+
+        return {
+            drive: google.drive({ version: 'v3', auth: _auth }),
+            sheets: google.sheets({ version: 'v4', auth: _auth })
+        };
+    }
+
+    private getHandler(type: string) {
+        switch (type) {
+            case 'file':
+                return spreadsheetHandler;
+            case 'csv':
+                return csvHandler;
+            case 'json':
+                return jsonHandler;
+            default:
+                return null;
+        }
+    }
+
     override async getAuthUrl(): Promise<string> {
         return this.getOAuthClient().generateAuthUrl({
             access_type: 'offline',
@@ -80,9 +107,7 @@ export default class GoogleConnector extends Connector {
     }
 
     override async listTables(path: string[], auth?: string) {
-        const _auth = this.getAuth(auth);
-        const drive = google.drive({ version: 'v3', auth: _auth });
-        const sheets = google.sheets({ version: 'v4', auth: _auth });
+        const clients = this.getClients(auth);
 
         if (path.length === 0) {
             const tables = [
@@ -93,21 +118,18 @@ export default class GoogleConnector extends Connector {
                 }
             ];
 
-            try {
-                const response = await drive.drives.list({
-                    pageSize: 10,
-                    useDomainAdminAccess: false
-                });
+            // Just need to check if any shared drives exist
+            const response = await clients.drive.drives.list({
+                pageSize: 1,
+                useDomainAdminAccess: false
+            });
 
-                if (response.data.drives && response.data.drives.length > 0) {
-                    tables.push({
-                        name: 'Shared Drives',
-                        path: ['drives'],
-                        capabilities: [ConnectorTableCapability.Explore]
-                    });
-                }
-            } catch (error) {
-                console.warn('Could not list shared drives:', error);
+            if (response.data.drives && response.data.drives.length > 0) {
+                tables.push({
+                    name: 'Shared Drives',
+                    path: ['drives'],
+                    capabilities: [ConnectorTableCapability.Explore]
+                });
             }
 
             return tables;
@@ -116,11 +138,20 @@ export default class GoogleConnector extends Connector {
         const [type, id] = path;
 
         if (type === 'drives') {
-            const response = await drive.drives.list({
-                pageSize: 100
-            });
+            const allDrives: drive_v3.Schema$Drive[] = [];
+            let pageToken: string | undefined;
 
-            return (response.data.drives || []).map((d: drive_v3.Schema$Drive) => ({
+            do {
+                const response = await clients.drive.drives.list({
+                    pageSize: 100,
+                    pageToken
+                });
+
+                if (response.data.drives) allDrives.push(...response.data.drives);
+                pageToken = response.data.nextPageToken ?? undefined;
+            } while (pageToken);
+
+            return allDrives.map((d: drive_v3.Schema$Drive) => ({
                 name: d.name || 'Unknown Drive',
                 path: ['drive', d.id!],
                 capabilities: [ConnectorTableCapability.Explore]
@@ -128,26 +159,36 @@ export default class GoogleConnector extends Connector {
         }
 
         if (type === 'folder' || type === 'drive') {
+            if (id && id !== 'root') validateFileId(id);
+
             const isSharedDrive = type === 'drive';
-            const queryParams: drive_v3.Params$Resource$Files$List = {
-                q: `'${id}' in parents and trashed = false`,
-                fields: 'nextPageToken, files(id, name, mimeType, shortcutDetails)',
-                pageSize: 100,
-                includeItemsFromAllDrives: true,
-                supportsAllDrives: true
-            };
+            const allFiles: drive_v3.Schema$File[] = [];
+            let pageToken: string | undefined;
 
-            if (isSharedDrive) {
-                queryParams.corpora = 'drive';
-                queryParams.driveId = id;
-            }
+            do {
+                const queryParams: drive_v3.Params$Resource$Files$List = {
+                    q: `'${id}' in parents and trashed = false`,
+                    fields: 'nextPageToken, files(id, name, mimeType, shortcutDetails)',
+                    pageSize: 100,
+                    includeItemsFromAllDrives: true,
+                    supportsAllDrives: true,
+                    pageToken
+                };
 
-            const response = await drive.files.list(queryParams);
+                if (isSharedDrive) {
+                    queryParams.corpora = 'drive';
+                    queryParams.driveId = id;
+                }
 
-            return (response.data.files || []).map((file: drive_v3.Schema$File) => {
+                const response = await clients.drive.files.list(queryParams);
+                if (response.data.files) allFiles.push(...response.data.files);
+
+                pageToken = response.data.nextPageToken ?? undefined;
+            } while (pageToken);
+
+            return allFiles.map((file: drive_v3.Schema$File) => {
                 let capability = ConnectorTableCapability.Unavailable;
                 let nextPath: string[] = [];
-                const currentPath = ['file', file.id!];
 
                 const isShortcut = file.mimeType === 'application/vnd.google-apps.shortcut';
                 const targetMimeType = isShortcut
@@ -162,18 +203,34 @@ export default class GoogleConnector extends Connector {
                 } else if (targetMimeType === 'application/vnd.google-apps.spreadsheet') {
                     capability = ConnectorTableCapability.Explore;
                     nextPath = ['file', targetId!];
+                } else if (
+                    targetMimeType === 'text/csv' ||
+                    targetMimeType === 'text/tab-separated-values' ||
+                    file.name?.toLowerCase().endsWith('.csv') ||
+                    file.name?.toLowerCase().endsWith('.tsv')
+                ) {
+                    capability = ConnectorTableCapability.Connect;
+                    nextPath = ['csv', targetId!];
+                } else if (
+                    targetMimeType === 'application/json' ||
+                    file.name?.toLowerCase().endsWith('.json')
+                ) {
+                    capability = ConnectorTableCapability.Connect;
+                    nextPath = ['json', targetId!];
                 }
 
                 return {
                     name: file.name || 'Unknown File',
-                    path: nextPath.length > 0 ? nextPath : currentPath,
+                    path: nextPath.length > 0 ? nextPath : ['file', file.id!],
                     capabilities: [capability]
                 };
             });
         }
 
         if (type === 'file') {
-            const response = await sheets.spreadsheets.get({
+            if (id) validateFileId(id);
+
+            const response = await clients.sheets.spreadsheets.get({
                 spreadsheetId: id
             });
 
@@ -190,169 +247,41 @@ export default class GoogleConnector extends Connector {
     override async getTable(path: string[], auth?: string) {
         const [type, fileId, sheetName] = path;
 
-        if (type !== 'file' || !fileId || !sheetName) {
-            throw new Error('Invalid path for getTable. Expected ["file", fileId, sheetName]');
+        if (!type) throw new Error('Invalid path for getTable. Type is required');
+
+        const handler = this.getHandler(type);
+        if (!handler || !fileId) {
+            throw new Error(`Invalid path for getTable. Unsupported type: ${type}`);
         }
 
-        const _auth = this.getAuth(auth);
-        const sheets = google.sheets({ version: 'v4', auth: _auth });
-
-        const response = await sheets.spreadsheets.values.get({
-            spreadsheetId: fileId,
-            range: sheetName
-        });
-
-        const rows = response.data.values || [];
-
-        if (rows.length === 0) return inferTable(sheetName, []);
-
-        const headers = rows[0]!.map(h => String(h));
-        const data = rows.slice(1).map((row: Record<string, unknown>[]) => {
-            const rowObj: Record<string, unknown> = {};
-            headers.forEach((header: string, index: number) => {
-                rowObj[header] = row[index];
-            });
-
-            return rowObj;
-        });
-
-        return inferTable(sheetName, data);
+        const clients = this.getClients(auth);
+        return handler.getTable(fileId, clients, sheetName);
     }
 
     override async getData(table: AppTable, auth?: string): Promise<DataSourceDefinition> {
-        const [type, fileId, sheetName] = table.path;
+        const [type] = table.path;
 
-        if (type !== 'file' || !fileId || !sheetName) {
-            return { type: DataSourceType.Inline, data: [] };
-        }
+        if (!type) throw new Error('Invalid path for getData. Type is required');
 
-        const _auth = this.getAuth(auth);
-        const sheets = google.sheets({ version: 'v4', auth: _auth });
+        const handler = this.getHandler(type);
+        if (!handler) throw new Error(`Invalid path for getData. Unsupported type: ${type}`);
 
-        const response = await sheets.spreadsheets.values.get({
-            spreadsheetId: fileId,
-            range: sheetName
-        });
-
-        const rows = response.data.values || [];
-
-        if (rows.length === 0) {
-            return { type: DataSourceType.Inline, data: [] };
-        }
-
-        const headers = rows[0]!.map(h => String(h));
-        const keyFields = table.fields.filter(f => f.isKey).map(f => f.name);
-
-        const data = rows.slice(1).reduce((acc: AppTableRow[], row) => {
-            const rowObj: AppTableRow = {};
-            let hasValidKeys = true;
-
-            headers.forEach((header: string, index: number) => {
-                let value = row[index];
-
-                const field = table.fields.find(f => f.name === header);
-                if (field && field.type === AppFieldType.JSON && typeof value === 'string') {
-                    try {
-                        value = JSON.parse(value);
-                    } catch (e) {
-                        console.warn(`Failed to parse JSON for field ${header}:`, e);
-                    }
-                }
-
-                rowObj[header] = value;
-            });
-
-            if (keyFields.length > 0) {
-                for (const keyField of keyFields) {
-                    const val = rowObj[keyField];
-                    if (val === undefined || val === null || String(val).trim() === '') {
-                        hasValidKeys = false;
-                        break;
-                    }
-                }
-            }
-
-            if (hasValidKeys) acc.push(rowObj);
-            return acc;
-        }, []);
-
-        return { type: DataSourceType.Inline, data };
+        const clients = this.getClients(auth);
+        return handler.getData(table, clients);
     }
 
     override async addRow(table: AppTable, auth?: string, row?: AppTableRow) {
         if (!row) return;
 
-        const [type, fileId, sheetName] = table.path;
+        const [type] = table.path;
 
-        if (type !== 'file' || !fileId || !sheetName) {
-            throw new Error('Invalid path for addRow. Expected ["file", fileId, sheetName]');
-        }
+        if (!type) throw new Error('Invalid path for addRow. Type is required');
 
-        const _auth = this.getAuth(auth);
-        const sheets = google.sheets({ version: 'v4', auth: _auth });
+        const handler = this.getHandler(type);
+        if (!handler) throw new Error(`Invalid path for addRow. Unsupported type: ${type}`);
 
-        const headerResponse = await sheets.spreadsheets.values.get({
-            spreadsheetId: fileId,
-            range: `${sheetName}!A1:ZZ1`
-        });
-
-        let headers =
-            headerResponse.data.values && headerResponse.data.values[0]
-                ? headerResponse.data.values[0].map(h => String(h))
-                : [];
-
-        const rowKeys = Object.keys(row);
-        const newColumns = rowKeys.filter(key => !headers.includes(key));
-
-        if (newColumns.length > 0) {
-            const startColIndex = headers.length;
-            const range = `${sheetName}!${this.getColumnLetter(startColIndex + 1)}1`;
-
-            await sheets.spreadsheets.values.update({
-                spreadsheetId: fileId,
-                range: range,
-                valueInputOption: 'RAW',
-                requestBody: {
-                    values: [newColumns]
-                }
-            });
-
-            headers = [...headers, ...newColumns];
-        }
-
-        const values = headers.map(header => {
-            let value = row[header];
-
-            const field = table.fields.find(f => f.name === header);
-            if (field && field.type === AppFieldType.JSON && typeof value === 'object') {
-                value = JSON.stringify(value);
-            }
-
-            if (typeof value === 'object' && value !== null) value = JSON.stringify(value);
-            return value ?? '';
-        });
-
-        await sheets.spreadsheets.values.append({
-            spreadsheetId: fileId,
-            range: sheetName,
-            valueInputOption: 'USER_ENTERED',
-            requestBody: {
-                values: [values]
-            }
-        });
-    }
-
-    private getColumnLetter(colIndex: number) {
-        let temp,
-            letter = '';
-
-        while (colIndex > 0) {
-            temp = (colIndex - 1) % 26;
-            letter = String.fromCharCode(temp + 65) + letter;
-            colIndex = (colIndex - temp - 1) / 26;
-        }
-
-        return letter;
+        const clients = this.getClients(auth);
+        return handler.addRow(table, row, clients);
     }
 
     override async updateRow(
@@ -362,152 +291,29 @@ export default class GoogleConnector extends Connector {
         row?: AppTableRow
     ) {
         if (!key || !row) return;
-        const [type, fileId, sheetName] = table.path;
 
-        if (type !== 'file' || !fileId || !sheetName) {
-            throw new Error('Invalid path for updateRow. Expected ["file", fileId, sheetName]');
-        }
+        const [type] = table.path;
 
-        const _auth = this.getAuth(auth);
-        const sheets = google.sheets({ version: 'v4', auth: _auth });
+        if (!type) throw new Error('Invalid path for updateRow. Type is required');
 
-        const response = await sheets.spreadsheets.values.get({
-            spreadsheetId: fileId,
-            range: sheetName
-        });
+        const handler = this.getHandler(type);
+        if (!handler) throw new Error(`Invalid path for updateRow. Unsupported type: ${type}`);
 
-        const rows = response.data.values || [];
-        if (rows.length === 0) return;
-
-        const headers = rows[0]!.map(h => String(h));
-
-        let rowIndex = -1;
-        let existingRowData: Record<string, unknown> = {};
-
-        for (let i = 1; i < rows.length; i++) {
-            const currentRow = rows[i]!;
-            const currentRowObj: Record<string, unknown> = {};
-            headers.forEach((h, idx) => {
-                currentRowObj[h] = currentRow[idx];
-            });
-
-            let match = true;
-            for (const k in key) {
-                if (String(currentRowObj[k]) !== String(key[k])) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match) {
-                rowIndex = i;
-                existingRowData = currentRowObj;
-                break;
-            }
-        }
-
-        if (rowIndex === -1) return;
-
-        const rowKeys = Object.keys(row);
-        const newColumns = rowKeys.filter(k => !headers.includes(k));
-        let updatedHeaders = [...headers];
-
-        if (newColumns.length > 0) {
-            const startColIndex = headers.length;
-            const range = `${sheetName}!${this.getColumnLetter(startColIndex + 1)}1`;
-
-            await sheets.spreadsheets.values.update({
-                spreadsheetId: fileId,
-                range: range,
-                valueInputOption: 'RAW',
-                requestBody: {
-                    values: [newColumns]
-                }
-            });
-
-            updatedHeaders = [...headers, ...newColumns];
-        }
-
-        const mergedData = { ...existingRowData, ...row };
-        const values = updatedHeaders.map(header => {
-            let value = mergedData[header];
-
-            const field = table.fields.find(f => f.name === header);
-            if (field && field.type === AppFieldType.JSON && typeof value === 'object') {
-                value = JSON.stringify(value);
-            }
-
-            if (typeof value === 'object' && value !== null) {
-                value = JSON.stringify(value);
-            }
-
-            return value ?? '';
-        });
-
-        const sheetRowNumber = rowIndex + 1;
-        const range = `${sheetName}!A${sheetRowNumber}`;
-
-        await sheets.spreadsheets.values.update({
-            spreadsheetId: fileId,
-            range: range,
-            valueInputOption: 'USER_ENTERED',
-            requestBody: {
-                values: [values]
-            }
-        });
+        const clients = this.getClients(auth);
+        return handler.updateRow(table, key, row, clients);
     }
 
     override async deleteRow(table: AppTable, auth?: string, key?: Record<string, unknown>) {
         if (!key) return;
-        const [type, fileId, sheetName] = table.path;
 
-        if (type !== 'file' || !fileId || !sheetName) {
-            throw new Error('Invalid path for deleteRow. Expected ["file", fileId, sheetName]');
-        }
+        const [type] = table.path;
 
-        const _auth = this.getAuth(auth);
-        const sheets = google.sheets({ version: 'v4', auth: _auth });
+        if (!type) throw new Error('Invalid path for deleteRow. Type is required');
 
-        const response = await sheets.spreadsheets.values.get({
-            spreadsheetId: fileId,
-            range: sheetName
-        });
+        const handler = this.getHandler(type);
+        if (!handler) throw new Error(`Invalid path for deleteRow. Unsupported type: ${type}`);
 
-        const rows = response.data.values || [];
-        if (rows.length === 0) return;
-
-        const headers = rows[0]!.map(h => String(h));
-
-        let rowIndex = -1;
-        for (let i = 1; i < rows.length; i++) {
-            const currentRow = rows[i]!;
-            const currentRowObj: Record<string, unknown> = {};
-            headers.forEach((h, idx) => {
-                currentRowObj[h] = currentRow[idx];
-            });
-
-            let match = true;
-            for (const k in key) {
-                if (String(currentRowObj[k]) !== String(key[k])) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match) {
-                rowIndex = i;
-                break;
-            }
-        }
-
-        if (rowIndex === -1) return;
-
-        const sheetRowNumber = rowIndex + 1;
-        const range = `${sheetName}!A${sheetRowNumber}:ZZ${sheetRowNumber}`;
-
-        await sheets.spreadsheets.values.clear({
-            spreadsheetId: fileId,
-            range: range
-        });
+        const clients = this.getClients(auth);
+        return handler.deleteRow(table, key, clients);
     }
 }
